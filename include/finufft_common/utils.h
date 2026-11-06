@@ -6,9 +6,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <new>
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "constants.h"
 #include "defines.h"
@@ -88,5 +91,29 @@ FINUFFT_ALWAYS_INLINE void arraywidcen(int64_t n, const T *a, T *w, T *c)
     *c = 0.0;
   }
 }
+
+// Allocator whose construct() default-initialises: resize() leaves new elements
+// unwritten, so the first touch happens in the loop that fills them. resize(n, value)
+// still fills.
+template<typename T>
+struct uninitialized_allocator : std::allocator<T> {
+  template<typename U>
+  struct rebind {
+    using other = uninitialized_allocator<U>;
+  };
+  uninitialized_allocator() = default;
+  template<typename U>
+  uninitialized_allocator(const uninitialized_allocator<U> &) noexcept {}
+  template<typename U>
+  void construct(U *p) {
+    ::new (static_cast<void *>(p)) U;
+  }
+  template<typename U, typename... Args>
+  void construct(U *p, Args &&...args) {
+    ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+  }
+};
+template<typename T>
+using uninitialized_vector = std::vector<T, uninitialized_allocator<T>>;
 
 } // namespace finufft::utils

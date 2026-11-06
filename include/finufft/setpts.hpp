@@ -159,6 +159,10 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
     if (opts.debug)
       printf("[%s] sort (sorted=%d):\t\t%.3g s\n", __func__, (int)sorted(),
              timer.elapsedsec());
+    timer.restart();
+    cacheSortedCoords();
+    if (opts.debug)
+      printf("[%s] sorted coords:\t\t%.3g s\n", __func__, timer.elapsedsec());
 
   } else { // ------------------------- TYPE 3 SETPTS -----------------------
            // (here we can precompute pre/post-phase factors and plan the t2)
@@ -290,6 +294,10 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
     if (opts.debug)
       printf("[%s t3] sort (sorted=%d):\t\t%.3g s\n", __func__, (int)sorted(),
              timer.elapsedsec());
+    timer.restart();
+    cacheSortedCoords();
+    if (opts.debug)
+      printf("[%s t3] sorted coords:\t\t%.3g s\n", __func__, timer.elapsedsec());
 
     // Plan and setpts once, for the (repeated) inner type 2 finufft call...
     timer.restart();

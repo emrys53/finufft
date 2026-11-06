@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -386,7 +385,8 @@ FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_3d_kernel(
 
 template<typename TF>
 template<typename OnRun>
-void FINUFFT_PLAN_T<TF>::walk_wrapped_subgrid(const Subgrid &sub, OnRun &&on_run) const
+FINUFFT_ALWAYS_INLINE void FINUFFT_PLAN_T<TF>::walk_wrapped_subgrid(const Subgrid &sub,
+                                                                OnRun &&on_run) const
 /* Walk the contiguous runs the subgrid shares with the fine grid.
    Calls on_run(gi, si, n) with the grid offset, the subgrid offset, and the run length
    (all counted in real elements). Wraps periodically onto the N1,N2,N3 box.
@@ -427,12 +427,8 @@ template<bool thread_safe>
 void FINUFFT_PLAN_T<TF>::drain_wrapped_subgrid(
     const Subgrid &sub, TF *FINUFFT_RESTRICT data_uniform, TF *du0) const
 /* Add a large subgrid (du0) to output grid (data_uniform), with periodic wrapping, and
-   zero du0 in the same pass. The thread_safe variant adds atomically, so any number of
-   subproblems may write one grid at once; the plain variant is for a writer that owns the
-   grid alone.
-   The zeroing rides along because the runs cover every cell of the box exactly once. The
-   cells no run reaches, the anti-alias gap and the tail, stay zero on their own: the
-   store past a row's end carries zeroed kernel lanes, so it writes back what it read.
+   leave du0 zeroed. Unless thread_safe is set, the caller must ensure concurrent drains
+   do not update the same grid elements.
    Atomic writes: R Blackwell, Nov 2020; the two variants merged into one function,
    M. Barbone 06/24.
    Previous args (N1, N2, N3) are now read from plan member nfdim[0..2].
@@ -440,17 +436,34 @@ void FINUFFT_PLAN_T<TF>::drain_wrapped_subgrid(
    The add back carries the zeroing, M. Barbone 8/26/26.
 */
 {
-  walk_wrapped_subgrid(sub, [&](BIGINT gi, BIGINT si, BIGINT n) {
-    for (BIGINT j = 0; j < n; ++j) {
-      if constexpr (thread_safe) { // NOLINT(*-branch-clone)
+  if constexpr (thread_safe) {
+    walk_wrapped_subgrid(sub, [&](BIGINT gi, BIGINT si, BIGINT n) {
+      for (BIGINT j = 0; j < n; ++j) {
 #pragma omp atomic
         data_uniform[gi + j] += du0[si + j];
-      } else {
-        data_uniform[gi + j] += du0[si + j];
+        du0[si + j] = 0;
       }
-      du0[si + j] = 0;
-    }
-  });
+    });
+  } else {
+    using batch_t           = xsimd::batch<TF>;
+    using mask_t            = typename batch_t::batch_bool_type;
+    constexpr BIGINT simd_size = BIGINT(batch_t::size);
+    walk_wrapped_subgrid(sub, [&](BIGINT gi, BIGINT si, BIGINT n) {
+      TF *FINUFFT_RESTRICT grid      = data_uniform + gi;
+      const TF *FINUFFT_RESTRICT box = du0 + si;
+      BIGINT j                       = 0;
+      for (; j + simd_size <= n; j += simd_size)
+        (batch_t::load_unaligned(grid + j) + batch_t::load_unaligned(box + j))
+            .store_unaligned(grid + j);
+      if (j < n) {
+        const auto mask = mask_t::from_mask((uint64_t(1) << (n - j)) - 1);
+        const auto sum  = xsimd::load(grid + j, mask, xsimd::unaligned_mode{}) +
+                         xsimd::load(box + j, mask, xsimd::unaligned_mode{});
+        xsimd::store(grid + j, sum, mask, xsimd::unaligned_mode{});
+      }
+    });
+    std::fill_n(du0, 2 * sub.cells(), TF(0));
+  }
 }
 
 template<typename TF>
@@ -497,10 +510,6 @@ inline double spread_pow_ndims(double x, int ndims) noexcept {
   return v;
 }
 
-// Most colour passes a schedule may take. Every pass ends on a barrier, so past this
-// count the barriers cost more than the guard they save.
-constexpr std::size_t spread_max_colours = 16;
-
 // Groups the subproblems of a tiled cut by colour; see SpreadSchedule. tile and piece
 // give each subproblem's tile and its piece of that tile.
 inline void spread_colour(const SpreadTileData &tiles, int nspread,
@@ -509,7 +518,7 @@ inline void spread_colour(const SpreadTileData &tiles, int nspread,
   // A subproblem writes its tile grown by half a kernel width on each side. Two tiles
   // two rows apart thus write disjoint boxes once the edge holds a kernel width and the
   // rounding of the points to the tile faces, so tiles of equal parity on every axis
-  // can share a pass. The pieces of one tile share its box, so each takes its own pass.
+  // can share a colour. Each piece of one tile receives its own colour.
   if (tiles.starts.size() < 2 || tiles.edge < nspread + 2) return;
   // Parity alternates along an axis, so the only pair of same-parity neighbours is the
   // one the periodic wrap makes between the first row and the last. Rows count the fine
@@ -517,38 +526,41 @@ inline void spread_colour(const SpreadTileData &tiles, int nspread,
   // points at the exact top coordinate, whose boxes wrap onto row 0. The run of rows
   // kept must be even, so an odd count drops its last row. An even count whose last row
   // is narrower than the gap two kernels need drops two, since across that row the wrap
-  // joins row 0 to a row of its own parity. The dropped rows form the seam. One row, or
-  // two, has no pair of distinct same-parity rows, so it drops nothing.
-  std::array<BIGINT, 3> kept{1, 1, 1};
+  // joins row 0 to a row of its own parity. One row, or two, has no pair of distinct
+  // same-parity rows, so it drops nothing. The dropped rows get classes of their own.
+  std::array<BIGINT, 3> kept{1, 1, 1}, nrows{1, 1, 1};
   for (int d = 0; d < 3; ++d) {
     if (tiles.nt[d] < 2) continue;
     const BIGINT rows = 1 + (tiles.ngrid[d] - 1) / tiles.edge;
+    nrows[d]          = rows;
     const BIGINT last = tiles.ngrid[d] - (rows - 1) * tiles.edge;
     kept[d]           = rows <= 2                    ? rows
                         : rows % 2                   ? rows - 1
                         : last < BIGINT(nspread) + 2 ? rows - 2
                                                      : rows;
   }
-  constexpr BIGINT seam = std::numeric_limits<BIGINT>::max();
-  const auto nsub       = tile.size();
+  // Row classes: parity 0/1; 2 for dropped row kept[d]; 3 for round-off rows.
+  // A thin last row keeps its parity: full rows separate it from other rows of that
+  // parity.
+  const auto nsub = tile.size();
   std::vector<BIGINT> key(nsub);
   for (std::size_t i = 0; i < nsub; ++i) {
-    BIGINT t = tile[i], parity = 0;
-    bool on_seam = false;
+    BIGINT t = tile[i], k = 0;
     for (int d = 0; d < 3; ++d) {
       const BIGINT row = t % tiles.nt[d];
       t /= tiles.nt[d];
-      on_seam |= row >= kept[d];
-      parity |= (row & 1) << d;
+      BIGINT row_class = row & 1;
+      row_class |= BIGINT(row == kept[d]) << 1;
+      row_class |= BIGINT(row >= nrows[d]) * 3;
+
+      k |= row_class << (2 * d);
     }
-    key[i] = on_seam ? seam : parity | piece[i] << 3;
+    key[i] = k | piece[i] << 6;
   }
   std::vector<BIGINT> colours(key);
   std::sort(colours.begin(), colours.end());
   colours.erase(std::unique(colours.begin(), colours.end()), colours.end());
-  if (colours.size() > spread_max_colours) return;
-  sched.seam = colours.back() == seam;
-  // a counting sort of the subproblems by colour, stable so each pass keeps the cut order
+  // Stable counting sort by colour: each group keeps the cut order.
   sched.group_start.assign(colours.size() + 1, 0);
   for (auto &k : key)
     k = std::lower_bound(colours.begin(), colours.end(), k) - colours.begin();
@@ -560,9 +572,106 @@ inline void spread_colour(const SpreadTileData &tiles, int nspread,
   for (std::size_t i = 0; i < nsub; ++i) sched.order[next[key[i]]++] = BIGINT(i);
 }
 
+// Use full tile extents plus kernel/rounding margins to conservatively detect overlap.
+// tile_of[subproblem] gives its tile ID.
+inline void spread_deps(const SpreadTileData &tiles, int nspread,
+                        const std::vector<BIGINT> &tile_of, SpreadSchedule &sched) {
+  const BIGINT num_subproblems = BIGINT(tile_of.size());
+  const BIGINT nx              = tiles.nt[0];
+  const BIGINT ny              = tiles.nt[1];
+  const BIGINT nz              = tiles.nt[2];
+  const BIGINT tile_edge       = tiles.edge;
+  const BIGINT lower_margin    = nspread / 2 + 1;
+  const BIGINT upper_margin    = nspread - nspread / 2 + 1;
+  // +2: a thin last row and the zero-width row past the grid take indices but almost no
+  // grid, so an overlap that wraps across them spans up to two more rows.
+  const BIGINT reach = 2 + (lower_margin + upper_margin + tile_edge - 1) / tile_edge;
+
+  // Rows whose possible writes overlap each row, including periodic wrap, ascending:
+  // row r of an axis has rows[axis][row_start[axis][r] .. row_start[axis][r + 1]).
+  std::array<std::vector<BIGINT>, 3> row_start, rows;
+  for (int axis = 0; axis < 3; ++axis) {
+    const BIGINT num_rows     = tiles.nt[axis];
+    const BIGINT grid_size    = tiles.ngrid[axis];
+    const auto write_interval = [&](BIGINT tile_row) {
+      const BIGINT begin = std::min(tile_row * tile_edge, grid_size);
+      const BIGINT end   = std::min((tile_row + 1) * tile_edge, grid_size);
+      return std::pair{begin - lower_margin, end + upper_margin};
+    };
+    row_start[axis].assign(num_rows + 1, 0);
+    for (BIGINT row = 0; row < num_rows; ++row) {
+      const auto interval = write_interval(row);
+      const BIGINT begin  = interval.first;
+      const BIGINT end    = interval.second;
+      const auto test = [&](BIGINT other) {
+        const auto other_interval = write_interval(other);
+        const BIGINT other_begin  = other_interval.first;
+        const BIGINT other_end    = other_interval.second;
+        for (const BIGINT shift : {-grid_size, BIGINT(0), grid_size}) {
+          if (other_begin + shift < end && begin < other_end + shift) {
+            rows[axis].push_back(other);
+            return;
+          }
+        }
+      };
+      if (2 * reach + 1 >= num_rows) {
+        for (BIGINT other = 0; other < num_rows; ++other) test(other);
+      } else {
+        // row - reach .. row + reach wrapped into [0, num_rows), in ascending order: the
+        // part wrapped past the top, the middle, the part wrapped below 0
+        const BIGINT lo = row - reach, hi = row + reach;
+        for (BIGINT other = 0; other <= hi - num_rows; ++other) test(other);
+        for (BIGINT other = std::max(lo, BIGINT(0)); other <= std::min(hi, num_rows - 1);
+             ++other)
+          test(other);
+        for (BIGINT other = lo + num_rows; other < num_rows; ++other) test(other);
+      }
+      row_start[axis][row + 1] = BIGINT(rows[axis].size());
+    }
+  }
+
+  std::vector<BIGINT> queue_position(num_subproblems);
+  for (BIGINT position = 0; position < num_subproblems; ++position)
+    queue_position[sched.order[position]] = position;
+
+  // Tile pieces have consecutive IDs, so tile t occupies [tile_begin[t], tile_begin[t+1]).
+  std::vector<BIGINT> tile_begin(nx * ny * nz + 1, 0);
+  for (const BIGINT tile_id : tile_of) ++tile_begin[tile_id + 1];
+  std::partial_sum(tile_begin.begin(), tile_begin.end(), tile_begin.begin());
+
+  sched.dep_start.assign(num_subproblems + 1, 0);
+  const auto walk = [&](bool fill_list) {
+    BIGINT filled = 0, tile_id = 0, tile_x = 0, tile_y = 0, tile_z = 0;
+    for (BIGINT subproblem = 0; subproblem < num_subproblems; ++subproblem) {
+      const BIGINT tile_id = tile_of[subproblem];
+      const BIGINT tile_x  = tile_id % nx;
+      const BIGINT tile_y  = (tile_id / nx) % ny;
+      const BIGINT tile_z  = tile_id / (nx * ny);
+      const BIGINT position = queue_position[subproblem];
+      for (BIGINT iz = row_start[2][tile_z]; iz < row_start[2][tile_z + 1]; ++iz)
+        for (BIGINT iy = row_start[1][tile_y]; iy < row_start[1][tile_y + 1]; ++iy)
+          for (BIGINT ix = row_start[0][tile_x]; ix < row_start[0][tile_x + 1]; ++ix) {
+            const BIGINT neighbor_tile =
+                rows[0][ix] + nx * (rows[1][iy] + ny * rows[2][iz]);
+            for (BIGINT predecessor = tile_begin[neighbor_tile];
+                 predecessor < tile_begin[neighbor_tile + 1]; ++predecessor)
+              if (queue_position[predecessor] < position) {
+                if (fill_list) sched.dep_list[filled] = predecessor;
+                ++filled;
+              }
+          }
+      if (!fill_list) sched.dep_start[subproblem + 1] = filled;
+    }
+  };
+  // Count first, then fill without growing the dependency list.
+  walk(false);
+  sched.dep_list.assign(sched.dep_start.back(), 0);
+  walk(true);
+}
+
 inline SpreadSchedule spread_schedule(const SpreadTileData &tiles, UBIGINT M,
                                       UBIGINT grid_cells, int nthr, int batchSize,
-                                      int nspread) {
+                                      int nspread, bool colour = true) {
   // Equal pieces of the point list, one piece at a time out of each tile: the pieces of a
   // tile share that tile's box, so a tile over the cap becomes that many subproblems of
   // the same box rather than one that holds a thread for several tiles' worth of work.
@@ -579,6 +688,7 @@ inline SpreadSchedule spread_schedule(const SpreadTileData &tiles, UBIGINT M,
       const UBIGINT pieces = 1 + (hi - lo - 1) / cap;
       for (UBIGINT c = 1; c <= pieces; ++c) {
         sched.bounds.push_back(lo + (hi - lo) * c / pieces);
+        if (!colour) continue;
         tile.push_back(BIGINT(t) - 1);
         piece.push_back(BIGINT(c) - 1);
       }
@@ -612,12 +722,14 @@ inline SpreadSchedule spread_schedule(const SpreadTileData &tiles, UBIGINT M,
   const UBIGINT wanted = spread_subproblems_per_thread * threads_per_vector;
   if (filled_tiles < wanted) cap = std::min(cap, 1 + (M - 1) / wanted);
   auto sched = cut(starts, std::max(cap, UBIGINT(1)));
+  if (!colour) return sched;
   spread_colour(tiles, nspread, tile, piece, sched);
+  if (!sched.order.empty()) spread_deps(tiles, nspread, tile, sched);
   return sched;
 }
 
 // Doublings of the fine cell per spread tile edge; zero keeps the tile at one cell. One
-// core's L2 sets the size: the strengths want a quarter of it, the padded subgrid (the
+// core's L2 sets the size: the strengths want half of it, the padded subgrid (the
 // tile grown by the kernel width) all of it, so the ceiling is on the padded edge.
 
 // TODO: the tile pays for its halo whatever the density, and empty tiles cost nothing,
@@ -637,7 +749,7 @@ inline int spread_tile_doublings(int cell, int ndims, int nspread,
            double(finufft::utils::getL2CacheSize() / spread_bytes_per_point);
   };
   // Grow while the next doubling keeps the padded subgrid in L2 and the tile's strengths
-  // in a quarter of it. The point budget only caps growth: a tile over it is split into
+  // in half of it. The point budget only caps growth: a tile over it is split into
   // subproblems of the cap instead.
   int doublings = 0;
   for (double edge = 2.0 * cell;
@@ -744,13 +856,24 @@ template<typename T, int ndims> struct BinIndexer {
   }
 };
 
+// Writes the folded coordinates of point i to slot pos of the coordinate cache.
+template<typename T, int ndims>
+inline void fold_to_slot(T *fx, T *fy, T *fz, const T *kx, const T *ky, const T *kz,
+                         UBIGINT N1, UBIGINT N2, UBIGINT N3, BIGINT pos, UBIGINT i) {
+  using finufft::spreadinterp::fold_rescale;
+  fx[pos] = fold_rescale<T>(kx[i], N1);
+  if constexpr (ndims > 1) fy[pos] = fold_rescale<T>(ky[i], N2);
+  if constexpr (ndims > 2) fz[pos] = fold_rescale<T>(kz[i], N3);
+}
+
 // FIXME: bin_sort_singlethread_impl can be changed to take XYZ and nfdim directly
 // instead of separate kx, ky, kz and N1, N2, N3 arguments.
 template<typename T, int ndims>
-inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, const T *kx,
-                                       const T *ky, const T *kz, UBIGINT N1, UBIGINT N2,
-                                       UBIGINT N3, int cell, int cell_bits,
-                                       SpreadTileData &tile_data_out)
+inline void bin_sort_singlethread_impl(finufft::utils::uninitialized_vector<BIGINT> &ret,
+                                       UBIGINT M, const T *kx, const T *ky, const T *kz,
+                                       UBIGINT N1, UBIGINT N2, UBIGINT N3, int cell,
+                                       int cell_bits, SpreadTileData &tile_data_out,
+                                       T *fx, T *fy, T *fz)
 /* Returns permutation of all nonuniform points with good RAM access,
  * ie less cache misses for spreading, in 1D, 2D, or 3D.
  *
@@ -762,7 +885,8 @@ inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, cons
  *
  * Inputs: M points kx,ky,kz in [-pi, pi) (folded in), box N1,N2,N3 (trailing dims 1),
  *         cubic bins of `cell` fine grid points, 2^cell_bits cells per tile edge.
- * Output: ret (preallocated to M) gets the permutation; tile_data_out the tile offsets.
+ * Output: ret (preallocated to M) gets the permutation; tile_data_out the tile offsets;
+ *         fx, fy, fz (unused dims null) get the folded coords of the point at each slot.
  *
  * Notes: I compared RAM usage against declaring an internal vector and passing
  * back; the latter used more RAM and was slower.
@@ -804,12 +928,14 @@ inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, cons
     const auto batch = bins.batch(i);
     for (std::size_t j = 0; j < simd_size; ++j) {
       ret[counts[batch[j]]] = BIGINT(j + i);
+      fold_to_slot<T, ndims>(fx, fy, fz, kx, ky, kz, N1, N2, N3, counts[batch[j]], j + i);
       ++counts[batch[j]];
     }
   }
   for (; i < M; i++) {
     const auto bin   = bins.at(i);
     ret[counts[bin]] = BIGINT(i);
+    fold_to_slot<T, ndims>(fx, fy, fz, kx, ky, kz, N1, N2, N3, counts[bin], i);
     ++counts[bin];
   }
   // after placement counts[b] is the end of bin b, so the last bin of tile t-1
@@ -824,10 +950,11 @@ inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, cons
 // FIXME: same as bin_sort_singlethread_impl - can take XYZ and nfdim instead of the
 // separate per-dimension arguments.
 template<typename T, int ndims>
-inline void bin_sort_multithread_impl(std::vector<BIGINT> &ret, UBIGINT M, const T *kx,
-                                      const T *ky, const T *kz, UBIGINT N1, UBIGINT N2,
-                                      UBIGINT N3, int cell, int nthr, int cell_bits,
-                                      SpreadTileData &tile_data_out)
+inline void bin_sort_multithread_impl(finufft::utils::uninitialized_vector<BIGINT> &ret,
+                                      UBIGINT M, const T *kx, const T *ky, const T *kz,
+                                      UBIGINT N1, UBIGINT N2, UBIGINT N3, int cell,
+                                      int nthr, int cell_bits,
+                                      SpreadTileData &tile_data_out, T *fx, T *fy, T *fz)
 /* Mostly-OpenMP'ed version of bin_sort, SIMD-vectorized per thread.
    Templated on ndims to eliminate branching in inner loops.
    For documentation see: bin_sort_singlethread_impl.
@@ -926,12 +1053,15 @@ inline void bin_sort_multithread_impl(std::vector<BIGINT> &ret, UBIGINT M, const
       const auto batch = bins.batch(i);
       for (std::size_t j = 0; j < simd_size; ++j) {
         ret[my_counts[batch[j]]] = BIGINT(j + i);
+        fold_to_slot<T, ndims>(fx, fy, fz, kx, ky, kz, N1, N2, N3, my_counts[batch[j]],
+                               j + i);
         ++my_counts[batch[j]];
       }
     }
     for (; i < chunk_end; i++) {
       const auto bin      = bins.at(i);
       ret[my_counts[bin]] = BIGINT(i);
+      fold_to_slot<T, ndims>(fx, fy, fz, kx, ky, kz, N1, N2, N3, my_counts[bin], i);
       ++my_counts[bin];
     }
   }
@@ -944,16 +1074,21 @@ void FINUFFT_PLAN_T<TF>::bin_sort_singlethread(int cell, int cell_bits,
                                                SpreadTileData &tile_data_out) {
   using namespace finufft::spreadinterp;
   const UBIGINT N1 = m.nfdim[0], N2 = m.nfdim[1], N3 = m.nfdim[2];
+  TF *fx = m.XYZ_foldresscaled[0].data(), *fy = m.XYZ_foldresscaled[1].data(),
+     *fz = m.XYZ_foldresscaled[2].data();
   const int ndims = ndims_from_Ns(N1, N2, N3);
   if (ndims == 1)
     bin_sort_singlethread_impl<TF, 1>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                      N1, N2, N3, cell, cell_bits, tile_data_out);
+                                      N1, N2, N3, cell, cell_bits, tile_data_out,
+                                      fx, fy, fz);
   else if (ndims == 2)
     bin_sort_singlethread_impl<TF, 2>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                      N1, N2, N3, cell, cell_bits, tile_data_out);
+                                      N1, N2, N3, cell, cell_bits, tile_data_out,
+                                      fx, fy, fz);
   else
     bin_sort_singlethread_impl<TF, 3>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                      N1, N2, N3, cell, cell_bits, tile_data_out);
+                                      N1, N2, N3, cell, cell_bits, tile_data_out,
+                                      fx, fy, fz);
 }
 
 template<typename TF>
@@ -961,16 +1096,21 @@ void FINUFFT_PLAN_T<TF>::bin_sort_multithread(int cell, int nthr, int cell_bits,
                                               SpreadTileData &tile_data_out) {
   using namespace finufft::spreadinterp;
   const UBIGINT N1 = m.nfdim[0], N2 = m.nfdim[1], N3 = m.nfdim[2];
+  TF *fx = m.XYZ_foldresscaled[0].data(), *fy = m.XYZ_foldresscaled[1].data(),
+     *fz = m.XYZ_foldresscaled[2].data();
   const int ndims = ndims_from_Ns(N1, N2, N3);
   if (ndims == 1)
     bin_sort_multithread_impl<TF, 1>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out);
+                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out,
+                                     fx, fy, fz);
   else if (ndims == 2)
     bin_sort_multithread_impl<TF, 2>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out);
+                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out,
+                                     fx, fy, fz);
   else
     bin_sort_multithread_impl<TF, 3>(m.sortIndices, m.nj, m.XYZ[0], m.XYZ[1], m.XYZ[2],
-                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out);
+                                     N1, N2, N3, cell, nthr, cell_bits, tile_data_out,
+                                     fx, fy, fz);
 }
 
 template<typename TF>

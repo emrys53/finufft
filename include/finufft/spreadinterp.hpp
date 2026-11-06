@@ -15,6 +15,11 @@
     in makeplan.hpp.
 */
 
+#include <atomic>
+#include <memory>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
 #include <finufft/interp.hpp>
 #include <finufft/plan.hpp>
 #include <finufft/spread.hpp>
@@ -127,9 +132,10 @@ template<typename TF> int FINUFFT_PLAN_T<TF>::tile_doublings(int cell) const noe
 }
 
 template<typename TF>
-SpreadSchedule FINUFFT_PLAN_T<TF>::make_schedule(int nthr, int batchSize) const {
+SpreadSchedule FINUFFT_PLAN_T<TF>::make_schedule(int nthr, int batchSize,
+                                                 bool colour) const {
   return spread_schedule(m.tiles, UBIGINT(m.nj), grid_size(), nthr, batchSize,
-                         m.spopts.nspread);
+                         m.spopts.nspread, colour);
 }
 
 template<typename TF>
@@ -196,6 +202,7 @@ void FINUFFT_PLAN_T<TF>::indexSort()
   if (m.spopts.debug)
     printf("\tspread tiles of %d grid pts per edge, cells of %d\n", cell << doublings,
            cell);
+  resizeCoordCache(); // the sorters fill it
   if (sort_nthr == 1)
     bin_sort_singlethread(cell, doublings, m.tiles);
   else // sort_nthr>1, user fixes # threads (>=2)
@@ -291,6 +298,29 @@ void FINUFFT_PLAN_T<TF>::indexSort()
 */
 
 template<typename TF>
+void FINUFFT_PLAN_T<TF>::cacheSortedCoords()
+// The bin sort fills the cache as it places the points; only an unsorted plan gathers.
+{
+  if (sorted()) return;
+  resizeCoordCache();
+  for (int idim = 0; idim < dim; ++idim) {
+    auto &out       = m.XYZ_foldresscaled[idim];
+    const TF *in    = m.XYZ[idim];
+    const UBIGINT N = UBIGINT(m.nfdim[idim]);
+#pragma omp parallel for num_threads(opts.nthreads) schedule(static)
+    for (BIGINT j = 0; j < m.nj; ++j)
+      out[size_t(j)] =
+          finufft::spreadinterp::fold_rescale<TF>(in[m.sortIndices[size_t(j)]], N);
+  }
+}
+
+template<typename TF>
+void FINUFFT_PLAN_T<TF>::resizeCoordCache()
+{
+  for (int idim = 0; idim < dim; ++idim) m.XYZ_foldresscaled[idim].resize(size_t(m.nj));
+}
+
+template<typename TF>
 int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
                                      const TF *data_nonuniform, int batchSize) const
 /* Spread NU pts (in sort order) to a uniform grid. See the block comment above.
@@ -299,7 +329,7 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
    laid out one after another in both arrays, share one pass: the (vector, subproblem)
    pairs are what threads draw from.
    Plan members used in place of the former free-function arguments:
-   sortIndices, nfdim[0..2], nj, XYZ[0..2], spopts, tiles, horner_coeffs, nc.
+   sortIndices, XYZ_foldresscaled[0..2], nfdim[0..2], nj, spopts, tiles, horner_coeffs, nc.
    Instantiated in src/spreadinterp.cpp; extern template in execute.cpp suppresses
    re-instantiation there.
    Magland Dec 2016; history in the block comment above.
@@ -313,9 +343,6 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
   const auto N2  = (UBIGINT)m.nfdim[1];
   const auto N3  = (UBIGINT)m.nfdim[2];
   const auto M   = (UBIGINT)m.nj;
-  const auto *kx = m.XYZ[0];
-  const auto *ky = m.XYZ[1];
-  const auto *kz = m.XYZ[2];
   CNTime timer{};
   const auto ndims     = ndims_from_Ns(N1, N2, N3);
   const auto N         = N1 * N2 * N3; // output array size
@@ -344,7 +371,7 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
   timer.start();
   // Skipping the sort leaves no tiles, and that list is one tile spanning the whole fine
   // grid, so one call cuts the points either way.
-  const SpreadSchedule sched = make_schedule(nthr, batchSize);
+  const SpreadSchedule sched = make_schedule(nthr, batchSize, nthr > 1);
   const auto &bounds         = sched.bounds;
   const UBIGINT nb           = bounds.size() - 1;
   if (m.spopts.debug)
@@ -352,55 +379,84 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
            (long long)(m.tiles.empty() ? 1 : m.tiles.starts.size() - 1),
            (long long)sched.points_per_subproblem);
 
-  // Each loop below collapses a rectangular (vector, subproblem) space and every thread
-  // draws pairs out of it. Neighbouring tiles' halos overlap on one vector's fine grid,
-  // so the add back needs a guard; a single pair per vector owns its grid and needs none.
-  // The queue advances roughly in order, so the threads in flight on vector ib sit inside
-  // its window of n iterations, at most min(nthr, n) of them, and that count picks the
-  // guard: a lock on that vector below spopts.atomic_threshold, atomic writes above it.
-  // A coloured schedule runs one pass per colour, and the subproblems of one colour write
-  // disjoint boxes, so only the seam pass takes a guard.
-  enum class Guard { none, lock, atomic };
-  const auto guard_for = [&](UBIGINT n) {
-    if (n < 2 || nthr < 2) return Guard::none;
-    return std::min(UBIGINT(nthr), n) > UBIGINT(m.spopts.atomic_threshold) ? Guard::atomic
-                                                                           : Guard::lock;
-  };
-  const bool coloured = !sched.group_start.empty() && nthr > 1;
-  if (m.spopts.debug && coloured)
-    printf("\tadd back: %lld colour passes%s\n",
-           (long long)(sched.group_start.size() - 1 - sched.seam),
-           sched.seam ? " and a guarded seam pass" : "");
-  std::vector<my_omp_lock_t> locks(nthr > 1 && nb > 1 ? batchSize : 0);
+  enum class AddBack { none, lock, atomic, deps };
+  const AddBack mode = [&] {
+    if (!sched.order.empty()) return AddBack::deps; // make_schedule colours only nthr > 1
+    if (nb < 2 || nthr < 2) return AddBack::none;
+    return std::min(UBIGINT(nthr), nb) > UBIGINT(m.spopts.atomic_threshold)
+               ? AddBack::atomic
+               : AddBack::lock;
+  }();
+  if (m.spopts.debug && mode == AddBack::deps)
+    printf("\tadd back: %lld colours, %lld dependencies\n",
+           (long long)(sched.group_start.size() - 1), (long long)sched.dep_list.size());
+  std::vector<my_omp_lock_t> locks(mode == AddBack::lock ? batchSize : 0);
   for (auto &l : locks) MY_OMP_INIT_LOCK(&l);
+  // Pad completion flags to avoid false sharing.
+  struct alignas(64) DoneFlag {
+    std::atomic<int> v{0};
+  };
+  auto done = mode == AddBack::deps
+                  ? std::make_unique<DoneFlag[]>(size_t(batchSize) * nb)
+                  : nullptr;
+  std::atomic<BIGINT> next_pos{0};
+  const auto spin_pause = [] {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_ia32_pause();
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#endif
+  };
 
 #pragma omp parallel num_threads(nthr)
   {
-    // local copies of NU pts and data for each subproblem
-    std::vector<TF> kx0{}, ky0{}, kz0{}, dd0{}, du0{};
-    const auto subproblem = [&](int ib, BIGINT isub, Guard guard) {
+    std::vector<TF> dd0{}, du0{};
+    // add the subgrid back into the fine grid under the mode's guard, and leave du0
+    // zeroed for the next subproblem
+    const auto add_back = [&](int ib, BIGINT isub, const Subgrid &sub) {
+      TF *FINUFFT_RESTRICT grid = data_uniform + ib * stride_u;
+      switch (mode) {
+      case AddBack::deps: {
+        DoneFlag *flags = done.get() + size_t(ib) * nb;
+        for (BIGINT i = sched.dep_start[isub]; i < sched.dep_start[isub + 1]; ++i)
+          while (!flags[sched.dep_list[i]].v.load(std::memory_order_acquire))
+            spin_pause();
+        drain_wrapped_subgrid<false>(sub, grid, du0.data());
+        flags[isub].v.store(1, std::memory_order_release);
+        return;
+      }
+      case AddBack::atomic:
+        drain_wrapped_subgrid<true>(sub, grid, du0.data());
+        return;
+      case AddBack::lock:
+        MY_OMP_SET_LOCK(&locks[ib]);
+        drain_wrapped_subgrid<false>(sub, grid, du0.data());
+        MY_OMP_UNSET_LOCK(&locks[ib]);
+        return;
+      case AddBack::none:
+        drain_wrapped_subgrid<false>(sub, grid, du0.data());
+        return;
+      }
+    };
+    const auto subproblem = [&](int ib, BIGINT isub) {
       // one subproblem of one vector: spread it into its own padded subgrid and add
       // that subgrid back into the fine grid
-      TF *FINUFFT_RESTRICT grid = data_uniform + ib * stride_u;
-      const TF *nu              = data_nonuniform + ib * stride_nu;
-      const auto M0             = bounds[isub + 1] - bounds[isub]; // # NU pts here
-      // copy the location and data vectors for the nonuniform points
-      kx0.resize(M0);
-      ky0.resize(M0 * (N2 > 1));
-      kz0.resize(M0 * (N3 > 1));
+      const TF *nu  = data_nonuniform + ib * stride_nu;
+      const auto M0 = bounds[isub + 1] - bounds[isub]; // # NU pts here
+      const TF *kx0 = m.XYZ_foldresscaled[0].data() + bounds[isub];
+      const TF *ky0 =
+          N2 > 1 ? m.XYZ_foldresscaled[1].data() + bounds[isub] : nullptr;
+      const TF *kz0 =
+          N3 > 1 ? m.XYZ_foldresscaled[2].data() + bounds[isub] : nullptr;
       dd0.resize(2 * M0); // complex strength data
       for (UBIGINT j = 0; j < M0; j++) {
-        // todo: can avoid this copying?
-        const auto kk = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
-        kx0[j]        = fold_rescale<TF>(kx[kk], N1);
-        if (N2 > 1) ky0[j] = fold_rescale<TF>(ky[kk], N2);
-        if (N3 > 1) kz0[j] = fold_rescale<TF>(kz[kk], N3);
-        dd0[j * 2]     = nu[kk * 2];     // real part
-        dd0[j * 2 + 1] = nu[kk * 2 + 1]; // imag part
+        const auto kk  = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
+        dd0[j * 2]     = nu[kk * 2];                      // real part
+        dd0[j * 2 + 1] = nu[kk * 2 + 1];                  // imag part
       }
       // The subproblem spreads into the padded subgrid around its own points; the add
       // back confines wrapping to walk_wrapped_subgrid, so no kernel wraps.
-      const Subgrid sub = get_subgrid(M0, kx0.data(), ky0.data(), kz0.data());
+      const Subgrid sub = get_subgrid(M0, kx0, ky0, kz0);
       if (m.spopts.debug > 1)
         print_subgrid_info(ndims, sub.off1, sub.off2, sub.off3, sub.padded_size1,
                            sub.size1, sub.size2, sub.size3, M0);
@@ -412,41 +468,24 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
       du0.resize(2 * sub.cells()); // complex
       assert(std::all_of(du0.begin(), du0.end(), [](TF v) { return v == TF(0); }));
       if (ndims == 1)
-        spread_subproblem_1d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                             dd0.data());
+        spread_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
       else if (ndims == 2)
-        spread_subproblem_2d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                             dd0.data());
+        spread_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
       else
-        spread_subproblem_3d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                             dd0.data());
-      // add the subgrid back into the fine grid under the guard, and leave du0 zeroed
-      // for the next subproblem
-      if (guard == Guard::atomic) {
-        drain_wrapped_subgrid<true>(sub, grid, du0.data());
-      } else {
-        if (guard == Guard::lock) MY_OMP_SET_LOCK(&locks[ib]);
-        drain_wrapped_subgrid<false>(sub, grid, du0.data());
-        if (guard == Guard::lock) MY_OMP_UNSET_LOCK(&locks[ib]);
-      }
+        spread_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
+      add_back(ib, isub, sub);
     };
-    if (coloured) {
-      // the barrier that ends each omp for keeps the next colour's writes off the boxes
-      // this colour is still writing
-      const BIGINT npass = BIGINT(sched.group_start.size()) - 1;
-      for (BIGINT c = 0; c < npass; ++c) {
-        const BIGINT lo = sched.group_start[c], hi = sched.group_start[c + 1];
-        const Guard guard =
-            sched.seam && c == npass - 1 ? guard_for(UBIGINT(hi - lo)) : Guard::none;
-#pragma omp for collapse(2) schedule(dynamic, 1) // each is big
-        for (int ib = 0; ib < batchSize; ib++)
-          for (BIGINT k = lo; k < hi; k++) subproblem(ib, sched.order[k], guard);
-      }
+    if (mode == AddBack::deps) {
+      // Claim in queue order so every predecessor is already claimed; the earliest
+      // unfinished task can therefore progress without dependency deadlock.
+      const BIGINT total = BIGINT(batchSize) * BIGINT(nb);
+      for (BIGINT k = next_pos.fetch_add(1, std::memory_order_relaxed); k < total;
+           k        = next_pos.fetch_add(1, std::memory_order_relaxed))
+        subproblem(int(k / BIGINT(nb)), sched.order[size_t(k % BIGINT(nb))]);
     } else {
-      const Guard guard = guard_for(nb);
 #pragma omp for collapse(2) schedule(dynamic, 1) // each is big
       for (int ib = 0; ib < batchSize; ib++)
-        for (BIGINT isub = 0; isub < BIGINT(nb); isub++) subproblem(ib, isub, guard);
+        for (BIGINT isub = 0; isub < BIGINT(nb); isub++) subproblem(ib, isub);
     }
   }
   for (auto &l : locks) MY_OMP_DESTROY_LOCK(&l);
@@ -466,7 +505,7 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
    cache-sized copy. Interpolation only reads the grid, so it needs no lock; the strengths
    go straight back to each point's pre-sort index, so no gathered strength buffer either.
    Plan members used in place of the former free-function arguments:
-   sortIndices, nfdim[0..2], nj, XYZ[0..2], spopts, tiles, horner_coeffs, nc.
+   sortIndices, XYZ_foldresscaled[0..2], nfdim[0..2], nj, spopts, tiles, horner_coeffs, nc.
    Instantiated in src/spreadinterp.cpp; extern template in execute.cpp suppresses
    re-instantiation there.
    Magland Dec 2016; history in the block comment above spreadSorted.
@@ -480,9 +519,6 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
   const auto N2  = (UBIGINT)m.nfdim[1];
   const auto N3  = (UBIGINT)m.nfdim[2];
   const auto M   = (UBIGINT)m.nj;
-  const auto *kx = m.XYZ[0];
-  const auto *ky = m.XYZ[1];
-  const auto *kz = m.XYZ[2];
   CNTime timer{};
   const auto ndims     = ndims_from_Ns(N1, N2, N3);
   const auto N         = N1 * N2 * N3; // output array size
@@ -502,7 +538,7 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
   timer.start();
   // Skipping the sort leaves no tiles, and that list is one tile spanning the whole fine
   // grid, so one call cuts the points either way.
-  const SpreadSchedule sched = make_schedule(nthr, batchSize);
+  const SpreadSchedule sched = make_schedule(nthr, batchSize, false);
   const auto &bounds         = sched.bounds;
   const UBIGINT nb           = bounds.size() - 1;
   if (m.spopts.debug)
@@ -512,8 +548,7 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
 
 #pragma omp parallel num_threads(nthr)
   {
-    // local copies of NU pts and the gathered subgrid for each subproblem
-    std::vector<TF> kx0{}, ky0{}, kz0{}, du0{};
+    std::vector<TF> du0{};
 #pragma omp for collapse(2) schedule(dynamic, 1) // each is big
     for (int ib = 0; ib < batchSize; ib++)
       for (BIGINT isub = 0; isub < BIGINT(nb); isub++) {
@@ -522,21 +557,15 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
         const TF *grid          = data_uniform + ib * stride_u;
         TF *FINUFFT_RESTRICT nu = data_nonuniform + ib * stride_nu;
         const auto M0           = bounds[isub + 1] - bounds[isub]; // # NU pts here
-        // copy the location vectors for the nonuniform points
-        kx0.resize(M0);
-        ky0.resize(M0 * (N2 > 1));
-        kz0.resize(M0 * (N3 > 1));
-        for (UBIGINT j = 0; j < M0; j++) {
-          // todo: can avoid this copying?
-          const auto kk = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
-          kx0[j]        = fold_rescale<TF>(kx[kk], N1);
-          if (N2 > 1) ky0[j] = fold_rescale<TF>(ky[kk], N2);
-          if (N3 > 1) kz0[j] = fold_rescale<TF>(kz[kk], N3);
-        }
+        const TF *kx0 = m.XYZ_foldresscaled[0].data() + bounds[isub];
+        const TF *ky0 =
+            N2 > 1 ? m.XYZ_foldresscaled[1].data() + bounds[isub] : nullptr;
+        const TF *kz0 =
+            N3 > 1 ? m.XYZ_foldresscaled[2].data() + bounds[isub] : nullptr;
         // read the subgrid out of the fine grid, so that every point of this subproblem
         // interpolates out of one cache-sized copy of it. The copy confines wrapping to
         // walk_wrapped_subgrid, so no kernel wraps.
-        const Subgrid sub = get_subgrid(M0, kx0.data(), ky0.data(), kz0.data());
+        const Subgrid sub       = get_subgrid(M0, kx0, ky0, kz0);
         if (m.spopts.debug > 1)
           print_subgrid_info(ndims, sub.off1, sub.off2, sub.off3, sub.padded_size1,
                              sub.size1, sub.size2, sub.size3, M0);
@@ -545,14 +574,11 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
         // The strengths go straight back to the index each point held before the sort.
         const BIGINT *idx = m.sortIndices.data() + bounds[isub];
         if (ndims == 1)
-          interp_subproblem_1d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               idx, nu);
+          interp_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0, idx, nu);
         else if (ndims == 2)
-          interp_subproblem_2d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               idx, nu);
+          interp_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0, idx, nu);
         else
-          interp_subproblem_3d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               idx, nu);
+          interp_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0, idx, nu);
       } // end main loop over subprobs
   }
   if (m.spopts.debug)

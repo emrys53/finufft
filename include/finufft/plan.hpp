@@ -74,6 +74,7 @@ FINUFFT_EXPORT_TEST void finufft_fft_cleanup();
 FINUFFT_EXPORT_TEST void finufft_fft_cleanup_threads();
 #include <finufft_common/constants.h>
 #include <finufft_common/spread_opts.h>
+#include <finufft_common/utils.h>
 #include <finufft_opts.h>
 
 // Tile metadata produced by bin-sort and consumed by the tiled spread/interp driver. A
@@ -95,13 +96,12 @@ struct SpreadTileData {
 struct SpreadSchedule {
   std::vector<UBIGINT> bounds;       // NU index breakpoints, one subproblem per gap
   UBIGINT points_per_subproblem = 0; // points one subproblem may hold
-  // Subproblems grouped by colour: the subproblems of one colour write disjoint boxes of
-  // the fine grid, so a pass over one colour needs no guard. order lists the subproblems
-  // colour by colour and group_start bounds each colour's run in it. Empty means no
-  // valid colouring, and every subproblem takes the guard. With seam set, the last group
-  // holds the tiles the periodic wrap leaves uncolourable, and it keeps the guard.
+  // order[queue_position] gives a subproblem ID, grouped by colour.
+  // group_start contains offsets into order; each group has disjoint write boxes.
+  // Both arrays are empty when no valid colouring is available.
   std::vector<BIGINT> order, group_start;
-  bool seam = false;
+  // Predecessor IDs for i occupy dep_list[dep_start[i]..dep_start[i+1]).
+  std::vector<BIGINT> dep_start, dep_list;
 };
 
 // A subgrid of the fine grid: its lowest corner and its extents in fine grid points.
@@ -180,7 +180,10 @@ private:
     BIGINT nk = 0;                 // number of nonuniform target freqs (type 3 only)
     std::array<const TF *, 3> XYZ{nullptr, nullptr, nullptr};
                                    // pointers to user's NU source coords (no alloc)
-    std::vector<BIGINT> sortIndices;  // bin-sort permutation of NU points
+    // bin-sort permutation of NU points; indexSort writes every slot
+    finufft::utils::uninitialized_vector<BIGINT> sortIndices;
+    // XYZ_foldresscaled[d][j] = fold_rescale(XYZ[d][sortIndices[j]], nfdim[d]).
+    std::array<finufft::utils::uninitialized_vector<TF>, 3> XYZ_foldresscaled;
     SpreadTileData tiles;             // tile offsets + metadata; empty unless tile-binned
 
     // --- Type 3 workspace (set by setpts for type 3 only) ---
@@ -293,11 +296,13 @@ private:
 
   void spreadcheck() const;
   void indexSort();
+  void cacheSortedCoords();
+  void resizeCoordCache();
   // The tiled spread policy, read off plan members: the doublings of the sort cell per
   // tile edge, and how the sorted points split into subproblems. The rules are pure
   // functions in spread.hpp, so a test can drive them on a synthetic tile layout.
   int tile_doublings(int cell) const noexcept;
-  SpreadSchedule make_schedule(int nthr, int batchSize) const;
+  SpreadSchedule make_schedule(int nthr, int batchSize, bool colour) const;
   // One entry point per dimension and direction, so the per-dimension TUs
   // (spreadinterp_1d/2d/3d.cpp) instantiate one dimension each. The signatures are
   // uniform: ky and kz are unread below their dimension and may be null there.
@@ -369,7 +374,9 @@ public:
   // which spread path the last setpts prepared: empty tiles mean the chunk cut
   const SpreadTileData &tile_data() const { return m.tiles; }
   // the permutation the sort produced, so a test can read a tile's points back
-  const std::vector<BIGINT> &sort_indices() const { return m.sortIndices; }
+  const finufft::utils::uninitialized_vector<BIGINT> &sort_indices() const {
+    return m.sortIndices;
+  }
   int nspread() const { return m.spopts.nspread; }
   // whether setpts sorts; fixed at plan creation, spopts.sort == 0 is the only no
   bool sorted() const { return m.spopts.sort != 0; }
