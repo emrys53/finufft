@@ -132,6 +132,20 @@ SpreadSchedule FINUFFT_PLAN_T<TF>::make_schedule(int nthr, int batchSize) const 
 }
 
 template<typename TF>
+void FINUFFT_PLAN_T<TF>::cacheSortedCoords() {
+  for (int idim = 0; idim < dim; ++idim) {
+    auto &out       = m.XYZ_foldresscaled[idim];
+    const TF *in    = m.XYZ[idim];
+    const UBIGINT N = UBIGINT(m.nfdim[idim]);
+    out.resize(size_t(m.nj));
+#pragma omp parallel for num_threads(opts.nthreads) schedule(static)
+    for (BIGINT j = 0; j < m.nj; ++j)
+      out[size_t(j)] =
+          finufft::spreadinterp::fold_rescale<TF>(in[m.sortIndices[size_t(j)]], N);
+  }
+}
+
+template<typename TF>
 void FINUFFT_PLAN_T<TF>::indexSort()
 /* Sorts the NU pts unless spopts.sort == 0, calling either single- or
    multi-threaded bin sort: sortIndices (preallocated to length nj) gets the
@@ -312,9 +326,6 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
   const auto N2  = (UBIGINT)m.nfdim[1];
   const auto N3  = (UBIGINT)m.nfdim[2];
   const auto M   = (UBIGINT)m.nj;
-  const auto *kx = m.XYZ[0];
-  const auto *ky = m.XYZ[1];
-  const auto *kz = m.XYZ[2];
   CNTime timer{};
   const auto ndims     = ndims_from_Ns(N1, N2, N3);
   const auto N         = N1 * N2 * N3; // output array size
@@ -371,7 +382,7 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
 #pragma omp parallel num_threads(nthr)
   {
     // local copies of NU pts and data for each subproblem
-    std::vector<TF> kx0{}, ky0{}, kz0{}, dd0{}, du0{};
+    std::vector<TF> dd0{}, du0{};
 #pragma omp for collapse(2) schedule(dynamic, 1) // each is big
     for (int ib = 0; ib < batchSize; ib++)
       for (BIGINT isub = 0; isub < BIGINT(nb); isub++) {
@@ -380,23 +391,20 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
         TF *FINUFFT_RESTRICT grid = data_uniform + ib * stride_u;
         const TF *nu              = data_nonuniform + ib * stride_nu;
         const auto M0             = bounds[isub + 1] - bounds[isub]; // # NU pts here
+        const TF *kx0 = m.XYZ_foldresscaled[0].data() + bounds[isub];
+        const TF *ky0 = N2 > 1 ? m.XYZ_foldresscaled[1].data() + bounds[isub] : nullptr;
+        const TF *kz0 = N3 > 1 ? m.XYZ_foldresscaled[2].data() + bounds[isub] : nullptr;
         // copy the location and data vectors for the nonuniform points
-        kx0.resize(M0);
-        ky0.resize(M0 * (N2 > 1));
-        kz0.resize(M0 * (N3 > 1));
         dd0.resize(2 * M0); // complex strength data
         for (UBIGINT j = 0; j < M0; j++) {
           // todo: can avoid this copying?
           const auto kk = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
-          kx0[j]        = fold_rescale<TF>(kx[kk], N1);
-          if (N2 > 1) ky0[j] = fold_rescale<TF>(ky[kk], N2);
-          if (N3 > 1) kz0[j] = fold_rescale<TF>(kz[kk], N3);
           dd0[j * 2]     = nu[kk * 2];     // real part
           dd0[j * 2 + 1] = nu[kk * 2 + 1]; // imag part
         }
         // The subproblem spreads into the padded subgrid around its own points; the add
         // back confines wrapping to walk_wrapped_subgrid, so no kernel wraps.
-        const Subgrid sub = get_subgrid(M0, kx0.data(), ky0.data(), kz0.data());
+        const Subgrid sub = get_subgrid(M0, kx0, ky0, kz0);
         if (m.spopts.debug > 1)
           print_subgrid_info(ndims, sub.off1, sub.off2, sub.off3, sub.padded_size1,
                              sub.size1, sub.size2, sub.size3, M0);
@@ -408,14 +416,11 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
         du0.resize(2 * sub.cells()); // complex
         assert(std::all_of(du0.begin(), du0.end(), [](TF v) { return v == TF(0); }));
         if (ndims == 1)
-          spread_subproblem_1d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               dd0.data());
+          spread_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
         else if (ndims == 2)
-          spread_subproblem_2d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               dd0.data());
+          spread_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
         else
-          spread_subproblem_3d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
-                               dd0.data());
+          spread_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
         // add the subgrid back into the fine grid, under the guard the thread count
         // chose, and leave du0 zeroed for the next subproblem
         if (use_atomic) {
@@ -458,9 +463,6 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
   const auto N2  = (UBIGINT)m.nfdim[1];
   const auto N3  = (UBIGINT)m.nfdim[2];
   const auto M   = (UBIGINT)m.nj;
-  const auto *kx = m.XYZ[0];
-  const auto *ky = m.XYZ[1];
-  const auto *kz = m.XYZ[2];
   CNTime timer{};
   const auto ndims     = ndims_from_Ns(N1, N2, N3);
   const auto N         = N1 * N2 * N3; // output array size
@@ -490,8 +492,8 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
 
 #pragma omp parallel num_threads(nthr)
   {
-    // local copies of NU pts and the gathered subgrid for each subproblem
-    std::vector<TF> kx0{}, ky0{}, kz0{}, du0{};
+    // local copy of the gathered subgrid for each subproblem
+    std::vector<TF> du0{};
 #pragma omp for collapse(2) schedule(dynamic, 1) // each is big
     for (int ib = 0; ib < batchSize; ib++)
       for (BIGINT isub = 0; isub < BIGINT(nb); isub++) {
@@ -500,21 +502,13 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
         const TF *grid          = data_uniform + ib * stride_u;
         TF *FINUFFT_RESTRICT nu = data_nonuniform + ib * stride_nu;
         const auto M0           = bounds[isub + 1] - bounds[isub]; // # NU pts here
-        // copy the location vectors for the nonuniform points
-        kx0.resize(M0);
-        ky0.resize(M0 * (N2 > 1));
-        kz0.resize(M0 * (N3 > 1));
-        for (UBIGINT j = 0; j < M0; j++) {
-          // todo: can avoid this copying?
-          const auto kk = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
-          kx0[j]        = fold_rescale<TF>(kx[kk], N1);
-          if (N2 > 1) ky0[j] = fold_rescale<TF>(ky[kk], N2);
-          if (N3 > 1) kz0[j] = fold_rescale<TF>(kz[kk], N3);
-        }
+        const TF *kx0 = m.XYZ_foldresscaled[0].data() + bounds[isub];
+        const TF *ky0 = N2 > 1 ? m.XYZ_foldresscaled[1].data() + bounds[isub] : nullptr;
+        const TF *kz0 = N3 > 1 ? m.XYZ_foldresscaled[2].data() + bounds[isub] : nullptr;
         // read the subgrid out of the fine grid, so that every point of this subproblem
         // interpolates out of one cache-sized copy of it. The copy confines wrapping to
         // walk_wrapped_subgrid, so no kernel wraps.
-        const Subgrid sub = get_subgrid(M0, kx0.data(), ky0.data(), kz0.data());
+        const Subgrid sub = get_subgrid(M0, kx0, ky0, kz0);
         if (m.spopts.debug > 1)
           print_subgrid_info(ndims, sub.off1, sub.off2, sub.off3, sub.padded_size1,
                              sub.size1, sub.size2, sub.size3, M0);
@@ -523,13 +517,13 @@ int FINUFFT_PLAN_T<TF>::interpSorted(TF *FINUFFT_RESTRICT data_uniform,
         // The strengths go straight back to the index each point held before the sort.
         const BIGINT *idx = m.sortIndices.data() + bounds[isub];
         if (ndims == 1)
-          interp_subproblem_1d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
+          interp_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0,
                                idx, nu);
         else if (ndims == 2)
-          interp_subproblem_2d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
+          interp_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0,
                                idx, nu);
         else
-          interp_subproblem_3d(sub, du0.data(), M0, kx0.data(), ky0.data(), kz0.data(),
+          interp_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0,
                                idx, nu);
       } // end main loop over subprobs
   }

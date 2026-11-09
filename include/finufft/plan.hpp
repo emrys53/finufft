@@ -177,6 +177,8 @@ private:
     std::array<const TF *, 3> XYZ{nullptr, nullptr, nullptr};
                                    // pointers to user's NU source coords (no alloc)
     uninitialized_vector<BIGINT> sortIndices; // bin-sort permutation of NU points
+    // XYZ_foldresscaled[d][j] = fold_rescale(XYZ[d][sortIndices[j]], nfdim[d])
+    std::array<uninitialized_vector<TF>, 3> XYZ_foldresscaled;
     SpreadTileData tiles;             // tile offsets + metadata; empty unless tile-binned
 
     // --- Type 3 workspace (set by setpts for type 3 only) ---
@@ -289,6 +291,7 @@ private:
 
   void spreadcheck() const;
   void indexSort();
+  void cacheSortedCoords();
   // The tiled spread policy, read off plan members: the doublings of the sort cell per
   // tile edge, and how the sorted points split into subproblems. The rules are pure
   // functions in spread.hpp, so a test can drive them on a synthetic tile layout.
