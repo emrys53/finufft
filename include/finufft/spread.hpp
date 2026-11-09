@@ -676,10 +676,10 @@ template<typename T, int ndims> struct BinIndexer {
 // FIXME: bin_sort_singlethread_impl can be changed to take XYZ and nfdim directly
 // instead of separate kx, ky, kz and N1, N2, N3 arguments.
 template<typename T, int ndims>
-inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, const T *kx,
-                                       const T *ky, const T *kz, UBIGINT N1, UBIGINT N2,
-                                       UBIGINT N3, int cell, int cell_bits,
-                                       SpreadTileData &tile_data_out)
+inline void bin_sort_singlethread_impl(finufft::utils::uninitialized_vector<BIGINT> &ret,
+                                       UBIGINT M, const T *kx, const T *ky, const T *kz,
+                                       UBIGINT N1, UBIGINT N2, UBIGINT N3, int cell,
+                                       int cell_bits, SpreadTileData &tile_data_out)
 /* Returns permutation of all nonuniform points with good RAM access,
  * ie less cache misses for spreading, in 1D, 2D, or 3D.
  *
@@ -755,9 +755,10 @@ inline void bin_sort_singlethread_impl(std::vector<BIGINT> &ret, UBIGINT M, cons
 // FIXME: same as bin_sort_singlethread_impl - can take XYZ and nfdim instead of the
 // separate per-dimension arguments.
 template<typename T, int ndims>
-inline void bin_sort_multithread_impl(std::vector<BIGINT> &ret, UBIGINT M, const T *kx,
-                                      const T *ky, const T *kz, UBIGINT N1, UBIGINT N2,
-                                      UBIGINT N3, int cell, int nthr, int cell_bits,
+inline void bin_sort_multithread_impl(finufft::utils::uninitialized_vector<BIGINT> &ret,
+                                      UBIGINT M, const T *kx, const T *ky, const T *kz,
+                                      UBIGINT N1, UBIGINT N2, UBIGINT N3, int cell,
+                                      int nthr, int cell_bits,
                                       SpreadTileData &tile_data_out)
 /* Mostly-OpenMP'ed version of bin_sort, SIMD-vectorized per thread.
    Templated on ndims to eliminate branching in inner loops.

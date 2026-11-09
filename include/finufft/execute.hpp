@@ -362,8 +362,9 @@ int FINUFFT_PLAN_T<TF>::execute_internal(TC *cj, TC *fk, bool adjoint, int ntran
              adjoint ? " adjoint" : "", ntrans_actual, nbatch, batchSize);
     // allocate temporary buffers
     bool scratch_provided = scratch_size >= size_t(nf() * batchSize);
-    std::vector<TC, xsimd::aligned_allocator<TC, 64>> fwBatch_(
-        scratch_provided ? 0 : nf() * batchSize);
+    // no zero fill: spreadSorted and deconvolveshuffle write every cell before it is read
+    finufft::utils::uninitialized_vector<TC, 64> fwBatch_(
+        scratch_provided || opts.spreadinterponly ? 0 : nf() * batchSize);
     TC *fwBatch = scratch_provided ? aligned_scratch : fwBatch_.data();
     for (int b = 0; b * batchSize < ntrans_actual; b++) { // .....loop b over batches
 
@@ -436,7 +437,7 @@ int FINUFFT_PLAN_T<TF>::execute_internal(TC *cj, TC *fk, bool adjoint, int ntran
     // We are trying to be clever here and re-use memory whenever possible.
     // Also, we allocate the memory for the "inner" NUFFT here as well,
     // so that it doesn't need to be reallocated for every batch.
-    std::vector<TC, xsimd::aligned_allocator<TC, 64>> buf1, buf2, buf3;
+    finufft::utils::uninitialized_vector<TC, 64> buf1, buf2, buf3;
     TC *CpBatch, *fwBatch, *fwBatch_inner;
     if (!adjoint) { // we can combine CpBatch and fwBatch_inner!
       buf1.resize(

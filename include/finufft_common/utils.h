@@ -6,9 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "constants.h"
 #include "defines.h"
@@ -88,5 +90,53 @@ FINUFFT_ALWAYS_INLINE void arraywidcen(int64_t n, const T *a, T *w, T *c)
     *c = 0.0;
   }
 }
+
+// Like std::allocator, but vector(n) and resize(n) leave new elements uninitialised.
+template<typename T, std::size_t Align = alignof(T)>
+struct uninitialized_allocator {
+  static_assert(Align >= alignof(T) && (Align & (Align - 1)) == 0,
+                "Align must be a power of two and at least alignof(T)");
+  using value_type      = T;
+  using is_always_equal = std::true_type;
+
+  // keep no-init and Align when std::vector rebinds
+  template<typename U>
+  struct rebind {
+    using other = uninitialized_allocator<U, (Align > alignof(U) ? Align : alignof(U))>;
+  };
+
+  uninitialized_allocator() = default;
+  template<typename U, std::size_t A>
+  uninitialized_allocator(const uninitialized_allocator<U, A> &) noexcept {}
+
+  [[nodiscard]] T *allocate(std::size_t n) {
+    return static_cast<T *>(::operator new(n * sizeof(T), std::align_val_t{Align}));
+  }
+  void deallocate(T *p, std::size_t) noexcept {
+    ::operator delete(p, std::align_val_t{Align});
+  }
+
+  template<typename U>
+  void construct(U *) noexcept {
+    static_assert(std::is_trivially_copyable_v<U> && std::is_trivially_destructible_v<U>,
+                  "uninitialized_allocator only works with trivially copyable and "
+                  "trivially destructible types");
+  }
+  template<typename U, typename... Args>
+  void construct(U *p, Args &&...args) {
+    ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+  }
+
+  template<typename U, std::size_t A>
+  bool operator==(const uninitialized_allocator<U, A> &) const noexcept {
+    return A == Align;
+  }
+  template<typename U, std::size_t A>
+  bool operator!=(const uninitialized_allocator<U, A> &) const noexcept {
+    return A != Align;
+  }
+};
+template<typename T, std::size_t Align = alignof(T)>
+using uninitialized_vector = std::vector<T, uninitialized_allocator<T, Align>>;
 
 } // namespace finufft::utils

@@ -74,6 +74,7 @@ FINUFFT_EXPORT_TEST void finufft_fft_cleanup();
 FINUFFT_EXPORT_TEST void finufft_fft_cleanup_threads();
 #include <finufft_common/constants.h>
 #include <finufft_common/spread_opts.h>
+#include <finufft_common/utils.h>
 #include <finufft_opts.h>
 
 // Tile metadata produced by bin-sort and consumed by the tiled spread/interp driver. A
@@ -126,6 +127,8 @@ template<typename TF> struct FINUFFT_PLAN_T { // the main plan class, fully C++
 
 private:
   using TC = std::complex<TF>;
+  template<typename T>
+  using uninitialized_vector = finufft::utils::uninitialized_vector<T>;
 
   // Type 3 rescaling/centering/phasing parameters:
   struct type3params {
@@ -173,16 +176,16 @@ private:
     BIGINT nk = 0;                 // number of nonuniform target freqs (type 3 only)
     std::array<const TF *, 3> XYZ{nullptr, nullptr, nullptr};
                                    // pointers to user's NU source coords (no alloc)
-    std::vector<BIGINT> sortIndices;  // bin-sort permutation of NU points
+    uninitialized_vector<BIGINT> sortIndices; // bin-sort permutation of NU points
     SpreadTileData tiles;             // tile offsets + metadata; empty unless tile-binned
 
     // --- Type 3 workspace (set by setpts for type 3 only) ---
     std::array<const TF *, 3> STU{nullptr, nullptr, nullptr};
                                    // pointers to user's target NU-point arrays (no alloc)
-    std::vector<TC> prephase;      // pre-phase factors for all input NU pts
-    std::vector<TC> deconv;        // 1/kernel_FT * phase at all output NU pts
-    std::array<std::vector<TF>, 3> XYZp;  // rescaled/centered source NU points (x'_j)
-    std::array<std::vector<TF>, 3> STUp;  // rescaled/centered target freqs (s'_k)
+    uninitialized_vector<TC> prephase;      // pre-phase factors for all input NU pts
+    uninitialized_vector<TC> deconv;        // 1/kernel_FT * phase at all output NU pts
+    std::array<uninitialized_vector<TF>, 3> XYZp;  // rescaled/centered source NU points (x'_j)
+    std::array<uninitialized_vector<TF>, 3> STUp;  // rescaled/centered target freqs (s'_k)
     type3params t3P;               // type 3 rescaling/centering/phasing params
     std::unique_ptr<const FINUFFT_PLAN_T<TF>> innerT2plan;
                                    // inner type-2 plan used in step 2 of type 3
@@ -362,7 +365,7 @@ public:
   // which spread path the last setpts prepared: empty tiles mean the chunk cut
   const SpreadTileData &tile_data() const { return m.tiles; }
   // the permutation the sort produced, so a test can read a tile's points back
-  const std::vector<BIGINT> &sort_indices() const { return m.sortIndices; }
+  const uninitialized_vector<BIGINT> &sort_indices() const { return m.sortIndices; }
   int nspread() const { return m.spopts.nspread; }
   // whether setpts sorts; fixed at plan creation, spopts.sort == 0 is the only no
   bool sorted() const { return m.spopts.sort != 0; }
