@@ -5,6 +5,7 @@
 #include <finufft/utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <numeric>
 #include <utility>
@@ -46,6 +47,21 @@ FINUFFT_ALWAYS_INLINE void simd_arrayrange(int64_t n, const T *a, T *lo, T *hi) 
   *lo = xsimd::reduce_min(vlo);
   *hi = xsimd::reduce_max(vhi);
 }
+
+template<bool PREFETCH_ONLY = false, typename TF>
+FINUFFT_ALWAYS_INLINE auto gather_strength(const TF *nu, const BIGINT *idx,
+                                           [[maybe_unused]] UBIGINT i,
+                                           UBIGINT M) noexcept {
+  constexpr UBIGINT lead = 16;
+  if constexpr (PREFETCH_ONLY) {
+    for (UBIGINT j = 0; j < std::min(M, lead); ++j)
+      utils::prefetch(nu + 2 * idx[j]);
+  } else {
+    if (i + lead < M) utils::prefetch(nu + 2 * idx[i + lead]);
+    const auto k = idx[i];
+    return std::array<TF, 2>{nu[2 * k], nu[2 * k + 1]};
+  }
+}
 } // namespace finufft::spreadinterp
 
 // ---------- FINUFFT_PLAN_T spread_subproblem_*_kernel method definitions ----------
@@ -56,7 +72,7 @@ template<typename TF>
 template<int NS, int NC>
 FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_1d_kernel(
     const BIGINT off1, TF *FINUFFT_RESTRICT du, const UBIGINT M, const TF *const kx,
-    const TF *const dd) const noexcept {
+    const TF *const nu, const BIGINT *idx) const noexcept {
   /* 1D spreader from nonuniform to uniform subproblem grid, without wrapping.
      Inputs:
      off1 - integer offset of left end of du subgrid from that of overall fine
@@ -65,7 +81,8 @@ FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_1d_kernel(
      M - number of NU pts in subproblem
      kx (length M) - are rescaled NU source locations, should lie in
                      [off1+ns/2,off1+size1-1-ns/2] so as kernels stay in bounds
-     dd (length M complex, interleaved) - source strengths
+     nu (complex, interleaved) - source strengths of all NU pts, in user order
+     idx (length M) - index into nu of each point of this subproblem
      Outputs:
      du (length size1 complex, interleaved) - preallocated uniform subgrid array,
           zero on entry: the kernel accumulates into it (see spreadSorted)
@@ -96,19 +113,21 @@ FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_1d_kernel(
   // the largest read is 16 floats with avx512
   // if larger instructions will be available or half precision is used, this should be
   // padded
+  gather_strength<true>(nu, idx, 0, M);
   for (uint64_t i{0}; i < M; i++) {
     // loop over NU pts
     // initializes a dd_pt that is const
     // should not make a difference in performance
     // but is a hint to the compiler that after the lambda
     // dd_pt is not modified and can be kept as is in a register
-    // given (re, im) in this case dd[i*2] and dd[i*2+1]
+    // given (re, im) in this case s[0] and s[1]
     // this function returns a simd register of size simd_size
     // initialized as follows:
     // +-----------------------+
     // |re|im|re|im|re|im|re|im|
     // +-----------------------+
-    const auto dd_pt = initialize_complex_register<simd_type>(dd[i * 2], dd[i * 2 + 1]);
+    const auto s = gather_strength(nu, idx, i, M);
+    const auto dd_pt = initialize_complex_register<simd_type>(s[0], s[1]);
     // ceil offset, hence rounding, must match that in get_subgrid...
     const auto i1 = BIGINT(std::ceil(kx[i] - ns2)); // fine grid start index
     // T(i1) has different semantics and results an extra cast
@@ -203,11 +222,12 @@ template<typename TF>
 template<int NS, int NC>
 FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_2d_kernel(
     const BIGINT off1, const BIGINT off2, const UBIGINT size1, TF *FINUFFT_RESTRICT du,
-    const UBIGINT M, const TF *kx, const TF *ky, const TF *dd) const noexcept
-/* spreader from dd (NU) to du (uniform) in 2D without wrapping.
+    const UBIGINT M, const TF *kx, const TF *ky, const TF *nu,
+    const BIGINT *idx) const noexcept
+/* spreader from nu (NU) to du (uniform) in 2D without wrapping.
    See above docs/notes for spread_subproblem_2d.
    kx,ky (size M) are NU locations in [off+ns/2,off+size-1-ns/2] in both dims.
-   dd (size M complex) are complex source strengths
+   nu, idx as in spread_subproblem_1d_kernel
    du (size size1*size2) is complex uniform output array, zero on entry
    For algoritmic details see spread_subproblem_1d_kernel.
    Previous arg horner_coeffs_ptr is now read from plan member horner_coeffs.data().
@@ -226,9 +246,11 @@ FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_2d_kernel(
   // values in all three directions in a single kernel evaluation call.
   static constexpr auto ns2 = NS * T(0.5);  // half spread width
   alignas(KBL::alignment) std::array<T, 2 * KBL::stride> kernel_values{0};
+  gather_strength<true>(nu, idx, 0, M);
   for (uint64_t pt = 0; pt < M; pt++) {
     // loop over NU pts
-    const auto dd_pt = initialize_complex_register<simd_type>(dd[pt * 2], dd[pt * 2 + 1]);
+    const auto s = gather_strength(nu, idx, pt, M);
+    const auto dd_pt = initialize_complex_register<simd_type>(s[0], s[1]);
     // ceil offset, hence rounding, must match that in get_subgrid...
     const auto i1 = (BIGINT)std::ceil(kx[pt] - ns2); // fine grid start indices
     const auto i2 = (BIGINT)std::ceil(ky[pt] - ns2);
@@ -303,7 +325,7 @@ template<int NS, int NC>
 FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_3d_kernel(
     const BIGINT off1, const BIGINT off2, const BIGINT off3, const UBIGINT size1,
     const UBIGINT size2, TF *FINUFFT_RESTRICT du, const UBIGINT M, const TF *kx,
-    const TF *ky, const TF *kz, const TF *dd) const noexcept
+    const TF *ky, const TF *kz, const TF *nu, const BIGINT *idx) const noexcept
 // 3D version of spread_subproblem_1d_kernel. du is zero on entry.
 // Previous arg horner_coeffs_ptr is now read from plan member horner_coeffs.data().
 // Converted to class member, Barbone 2/24/26.
@@ -320,9 +342,11 @@ FINUFFT_NEVER_INLINE void FINUFFT_PLAN_T<TF>::spread_subproblem_3d_kernel(
   static constexpr auto ns2 = NS * T(0.5); // half spread width
   alignas(KBL::alignment) std::array<T, 3 * KBL::stride> kernel_values{0};
 
+  gather_strength<true>(nu, idx, 0, M);
   for (uint64_t pt = 0; pt < M; pt++) {
     // loop over NU pts
-    const auto dd_pt = initialize_complex_register<simd_type>(dd[pt * 2], dd[pt * 2 + 1]);
+    const auto s = gather_strength(nu, idx, pt, M);
+    const auto dd_pt = initialize_complex_register<simd_type>(s[0], s[1]);
     // ceil offset, hence rounding, must match that in get_subgrid...
     const auto i1 = (BIGINT)std::ceil(kx[pt] - ns2); // fine grid start indices
     const auto i2 = (BIGINT)std::ceil(ky[pt] - ns2);
@@ -961,13 +985,14 @@ template<typename TF> struct FINUFFT_PLAN_T<TF>::SpreadSubproblem1dCaller {
   TF *du;
   UBIGINT M;
   const TF *kx;
-  const TF *dd;
+  const TF *nu;
+  const BIGINT *idx;
   template<int NS, int NC>
   int operator()() const {
     if constexpr (!::finufft::kernel::ValidKernelParams<NS, NC>())
       return finufft::spreadinterp::report_invalid_kernel_params(NS, NC);
     else {
-      plan.template spread_subproblem_1d_kernel<NS, NC>(sub.off1, du, M, kx, dd);
+      plan.template spread_subproblem_1d_kernel<NS, NC>(sub.off1, du, M, kx, nu, idx);
       return 0;
     }
   }
@@ -980,13 +1005,14 @@ template<typename TF> struct FINUFFT_PLAN_T<TF>::SpreadSubproblem2dCaller {
   UBIGINT M;
   const TF *kx;
   const TF *ky;
-  const TF *dd;
+  const TF *nu;
+  const BIGINT *idx;
   template<int NS, int NC> int operator()() const {
     if constexpr (!::finufft::kernel::ValidKernelParams<NS, NC>())
       return finufft::spreadinterp::report_invalid_kernel_params(NS, NC);
     else {
       plan.template spread_subproblem_2d_kernel<NS, NC>(
-          sub.off1, sub.off2, sub.padded_size1, du, M, kx, ky, dd);
+          sub.off1, sub.off2, sub.padded_size1, du, M, kx, ky, nu, idx);
       return 0;
     }
   }
@@ -1000,14 +1026,15 @@ template<typename TF> struct FINUFFT_PLAN_T<TF>::SpreadSubproblem3dCaller {
   const TF *kx;
   const TF *ky;
   const TF *kz;
-  const TF *dd;
+  const TF *nu;
+  const BIGINT *idx;
   template<int NS, int NC> int operator()() const {
     if constexpr (!::finufft::kernel::ValidKernelParams<NS, NC>())
       return finufft::spreadinterp::report_invalid_kernel_params(NS, NC);
     else {
       plan.template spread_subproblem_3d_kernel<NS, NC>(sub.off1, sub.off2, sub.off3,
                                                         sub.padded_size1, sub.size2, du,
-                                                        M, kx, ky, kz, dd);
+                                                        M, kx, ky, kz, nu, idx);
       return 0;
     }
   }
@@ -1021,14 +1048,14 @@ template<typename TF>
 void FINUFFT_PLAN_T<TF>::spread_subproblem_1d(
     const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M, const TF *kx,
     [[maybe_unused]] const TF *ky, [[maybe_unused]] const TF *kz,
-    const TF *dd) const noexcept
-// Spreads the M NU points (kx, dd) into the subgrid du. Uses plan members
+    const TF *nu, const BIGINT *idx) const noexcept
+// Spreads the M NU points (kx, nu, idx) into the subgrid du. Uses plan members
 // spopts.nspread, nc and horner_coeffs for the kernel dispatch; previous args (opts,
 // horner_coeffs_ptr, nc) are now those plan members.
 {
   using namespace finufft::spreadinterp;
   using namespace finufft::common;
-  SpreadSubproblem1dCaller caller{*this, sub, du, M, kx, dd};
+  SpreadSubproblem1dCaller caller{*this, sub, du, M, kx, nu, idx};
   using NsSeq = poet::inclusive_range<MIN_NSPREAD, MAX_NSPREAD<TF>>;
   using NcSeq = poet::inclusive_range<MIN_NC, MAX_NC>;
   poet::dispatch(caller, std::make_tuple(poet::dispatch_param<NsSeq>{m.spopts.nspread},
@@ -1038,12 +1065,12 @@ void FINUFFT_PLAN_T<TF>::spread_subproblem_1d(
 template<typename TF>
 void FINUFFT_PLAN_T<TF>::spread_subproblem_2d(
     const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M, const TF *kx, const TF *ky,
-    [[maybe_unused]] const TF *kz, const TF *dd) const noexcept
+    [[maybe_unused]] const TF *kz, const TF *nu, const BIGINT *idx) const noexcept
 // 2D version of spread_subproblem_1d.
 {
   using namespace finufft::spreadinterp;
   using namespace finufft::common;
-  SpreadSubproblem2dCaller caller{*this, sub, du, M, kx, ky, dd};
+  SpreadSubproblem2dCaller caller{*this, sub, du, M, kx, ky, nu, idx};
   using NsSeq = poet::inclusive_range<MIN_NSPREAD, MAX_NSPREAD<TF>>;
   using NcSeq = poet::inclusive_range<MIN_NC, MAX_NC>;
   poet::dispatch(caller, std::make_tuple(poet::dispatch_param<NsSeq>{m.spopts.nspread},
@@ -1051,14 +1078,14 @@ void FINUFFT_PLAN_T<TF>::spread_subproblem_2d(
 }
 
 template<typename TF>
-void FINUFFT_PLAN_T<TF>::spread_subproblem_3d(const Subgrid &sub, TF *FINUFFT_RESTRICT du,
-                                              UBIGINT M, const TF *kx, const TF *ky,
-                                              const TF *kz, const TF *dd) const noexcept
+void FINUFFT_PLAN_T<TF>::spread_subproblem_3d(
+    const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M, const TF *kx, const TF *ky,
+    const TF *kz, const TF *nu, const BIGINT *idx) const noexcept
 // 3D version of spread_subproblem_1d.
 {
   using namespace finufft::spreadinterp;
   using namespace finufft::common;
-  SpreadSubproblem3dCaller caller{*this, sub, du, M, kx, ky, kz, dd};
+  SpreadSubproblem3dCaller caller{*this, sub, du, M, kx, ky, kz, nu, idx};
   using NsSeq = poet::inclusive_range<MIN_NSPREAD, MAX_NSPREAD<TF>>;
   using NcSeq = poet::inclusive_range<MIN_NC, MAX_NC>;
   poet::dispatch(caller, std::make_tuple(poet::dispatch_param<NsSeq>{m.spopts.nspread},

@@ -250,16 +250,18 @@ private:
   // these kernels used to do (see spreadSorted).
   template<int NS, int NC>
   void spread_subproblem_1d_kernel(BIGINT off1, TF *FINUFFT_RESTRICT du, UBIGINT M,
-                                   const TF *kx, const TF *dd) const noexcept;
+                                   const TF *kx, const TF *nu,
+                                   const BIGINT *idx) const noexcept;
   template<int NS, int NC>
   void spread_subproblem_2d_kernel(BIGINT off1, BIGINT off2, UBIGINT size1,
                                    TF *FINUFFT_RESTRICT du, UBIGINT M, const TF *kx,
-                                   const TF *ky, const TF *dd) const noexcept;
+                                   const TF *ky, const TF *nu,
+                                   const BIGINT *idx) const noexcept;
   template<int NS, int NC>
   void spread_subproblem_3d_kernel(BIGINT off1, BIGINT off2, BIGINT off3, UBIGINT size1,
                                    UBIGINT size2, TF *FINUFFT_RESTRICT du, UBIGINT M,
                                    const TF *kx, const TF *ky, const TF *kz,
-                                   const TF *dd) const noexcept;
+                                   const TF *nu, const BIGINT *idx) const noexcept;
 
   // Nested caller types that turn the runtime kernel width and Horner degree into
   // template arguments, one per dimension and direction. Bodies are in spread.hpp and
@@ -302,13 +304,13 @@ private:
   // uniform: ky and kz are unread below their dimension and may be null there.
   void spread_subproblem_1d(const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M,
                             const TF *kx, const TF *ky, const TF *kz,
-                            const TF *dd) const noexcept;
+                            const TF *nu, const BIGINT *idx) const noexcept;
   void spread_subproblem_2d(const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M,
                             const TF *kx, const TF *ky, const TF *kz,
-                            const TF *dd) const noexcept;
+                            const TF *nu, const BIGINT *idx) const noexcept;
   void spread_subproblem_3d(const Subgrid &sub, TF *FINUFFT_RESTRICT du, UBIGINT M,
                             const TF *kx, const TF *ky, const TF *kz,
-                            const TF *dd) const noexcept;
+                            const TF *nu, const BIGINT *idx) const noexcept;
   // idx[j] is where point j of this subproblem sat before the sort, which is where its
   // strength goes back to in dd.
   void interp_subproblem_1d(const Subgrid &sub, const TF *du, UBIGINT M, const TF *kx,

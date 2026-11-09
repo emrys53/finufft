@@ -381,8 +381,8 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
 
 #pragma omp parallel num_threads(nthr)
   {
-    // local copies of NU pts and data for each subproblem
-    std::vector<TF> dd0{}, du0{};
+    // local copy of the subgrid for each subproblem
+    std::vector<TF> du0{};
 #pragma omp for collapse(2) schedule(dynamic, 1) // each is big
     for (int ib = 0; ib < batchSize; ib++)
       for (BIGINT isub = 0; isub < BIGINT(nb); isub++) {
@@ -394,14 +394,7 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
         const TF *kx0 = m.XYZ_foldresscaled[0].data() + bounds[isub];
         const TF *ky0 = N2 > 1 ? m.XYZ_foldresscaled[1].data() + bounds[isub] : nullptr;
         const TF *kz0 = N3 > 1 ? m.XYZ_foldresscaled[2].data() + bounds[isub] : nullptr;
-        // copy the location and data vectors for the nonuniform points
-        dd0.resize(2 * M0); // complex strength data
-        for (UBIGINT j = 0; j < M0; j++) {
-          // todo: can avoid this copying?
-          const auto kk = m.sortIndices[j + bounds[isub]]; // NU pt from the index list
-          dd0[j * 2]     = nu[kk * 2];     // real part
-          dd0[j * 2 + 1] = nu[kk * 2 + 1]; // imag part
-        }
+        const BIGINT *idx = m.sortIndices.data() + bounds[isub];
         // The subproblem spreads into the padded subgrid around its own points; the add
         // back confines wrapping to walk_wrapped_subgrid, so no kernel wraps.
         const Subgrid sub = get_subgrid(M0, kx0, ky0, kz0);
@@ -416,11 +409,11 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
         du0.resize(2 * sub.cells()); // complex
         assert(std::all_of(du0.begin(), du0.end(), [](TF v) { return v == TF(0); }));
         if (ndims == 1)
-          spread_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
+          spread_subproblem_1d(sub, du0.data(), M0, kx0, ky0, kz0, nu, idx);
         else if (ndims == 2)
-          spread_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
+          spread_subproblem_2d(sub, du0.data(), M0, kx0, ky0, kz0, nu, idx);
         else
-          spread_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0, dd0.data());
+          spread_subproblem_3d(sub, du0.data(), M0, kx0, ky0, kz0, nu, idx);
         // add the subgrid back into the fine grid, under the guard the thread count
         // chose, and leave du0 zeroed for the next subproblem
         if (use_atomic) {
