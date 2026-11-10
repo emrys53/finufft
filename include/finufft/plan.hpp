@@ -301,7 +301,7 @@ private:
   // The tiled spread policy, read off plan members: the doublings of the sort cell per
   // tile edge, and how the sorted points split into subproblems. The rules are pure
   // functions in spread.hpp, so a test can drive them on a synthetic tile layout.
-  int tile_doublings(int cell) const noexcept;
+  int tile_doublings(int cell, int nthr) const noexcept;
   SpreadSchedule make_schedule(int nthr, int batchSize, bool colour) const;
   // One entry point per dimension and direction, so the per-dimension TUs
   // (spreadinterp_1d/2d/3d.cpp) instantiate one dimension each. The signatures are

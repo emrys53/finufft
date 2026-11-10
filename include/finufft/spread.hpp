@@ -734,9 +734,14 @@ inline SpreadSchedule spread_schedule(const SpreadTileData &tiles, UBIGINT M,
 
 // TODO: the tile pays for its halo whatever the density, and empty tiles cost nothing,
 // so what is left to win is a tile edge that grows with the halo it has to pay for.
+//
+// A tile grid with fewer than wanted tiles cannot give every thread tiles of its own,
+// whatever the cache says, so growth also stops there, but never below an edge of
+// nspread + 2. nf is the fine grid; wanted = 0 turns the stop off.
 template<class TF>
-inline int spread_tile_doublings(int cell, int ndims, int nspread,
-                                 double density) noexcept {
+inline int spread_tile_doublings(int cell, int ndims, int nspread, double density,
+                                 const std::array<BIGINT, 3> &nf = {1, 1, 1},
+                                 UBIGINT wanted                  = 0) noexcept {
   // What the subproblem allocates, not the bare padded tile: set_row_layout may add an
   // anti-alias line to the row stride, and cells() one tail past the last row. The line
   // is counted always, since which sizes take it is not known until the points are in.
@@ -748,12 +753,19 @@ inline int spread_tile_doublings(int cell, int ndims, int nspread,
     return (edge + nspread + line) * rows + tail <=
            double(finufft::utils::getL2CacheSize() / spread_bytes_per_point);
   };
+  const auto too_few_tiles = [=](double edge) {
+    if (edge / 2 < nspread + 2) return false;
+    double tiles = 1;
+    for (int d = 0; d < ndims; ++d)
+      tiles *= double((nf[d] + BIGINT(edge) - 1) / BIGINT(edge));
+    return tiles < double(wanted);
+  };
   // Grow while the next doubling keeps the padded subgrid in L2 and the tile's strengths
   // in half of it. The point budget only caps growth: a tile over it is split into
   // subproblems of the cap instead.
   int doublings = 0;
   for (double edge = 2.0 * cell;
-       padded_fits_l2(edge) &&
+       padded_fits_l2(edge) && !too_few_tiles(edge) &&
        density * spread_pow_ndims(edge, ndims) <= double(spread_point_budget());
        edge *= 2)
     ++doublings;

@@ -124,11 +124,16 @@ FINUFFT_PLAN_T<TF>::Kernel_onedim_FT::Kernel_onedim_FT(const FINUFFT_PLAN_T &pla
   prefac = TF(pf);
 }
 
-template<typename TF> int FINUFFT_PLAN_T<TF>::tile_doublings(int cell) const noexcept {
+template<typename TF>
+int FINUFFT_PLAN_T<TF>::tile_doublings(int cell, int nthr) const noexcept {
   using finufft::spreadinterp::ndims_from_Ns;
+  // the tiles spread_cut_cap wants: spread_subproblems_per_thread per thread per vector
+  const UBIGINT threads_per_vector = (UBIGINT(nthr) + batchSize - 1) / batchSize;
+  const UBIGINT wanted = nthr > 1 ? spread_subproblems_per_thread * threads_per_vector : 0;
   return spread_tile_doublings<TF>(cell,
                                    ndims_from_Ns(m.nfdim[0], m.nfdim[1], m.nfdim[2]),
-                                   m.spopts.nspread, double(m.nj) / double(grid_size()));
+                                   m.spopts.nspread, double(m.nj) / double(grid_size()),
+                                   m.nfdim, wanted);
 }
 
 template<typename TF>
@@ -189,7 +194,7 @@ void FINUFFT_PLAN_T<TF>::indexSort()
     // cover (cell+ns)^ndims and every point of the cell revisits them. Grow from 4
     // while the doubled cell's write set fits L1 and the tile keeps two cells per edge.
     int edge              = 4;
-    int shift             = tile_doublings(edge);
+    int shift             = tile_doublings(edge, maxnthr);
     // complex fine-grid elements L1 holds, the unit a cell's write set is counted in
     const double l1_cells = double(finufft::utils::getL1CacheSize()) / (2 * sizeof(TF));
     while (
@@ -392,8 +397,7 @@ int FINUFFT_PLAN_T<TF>::spreadSorted(TF *FINUFFT_RESTRICT data_uniform,
            (long long)(sched.group_start.size() - 1), (long long)sched.dep_list.size());
   std::vector<my_omp_lock_t> locks(mode == AddBack::lock ? batchSize : 0);
   for (auto &l : locks) MY_OMP_INIT_LOCK(&l);
-  // Pad completion flags to avoid false sharing.
-  struct alignas(64) DoneFlag {
+  struct DoneFlag {
     std::atomic<int> v{0};
   };
   auto done = mode == AddBack::deps
